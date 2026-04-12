@@ -1,5 +1,17 @@
 # Changelog
 
+## v6.0.0 (2026-04-11)
+
+- Added 4 structural patterns (based on MDPI 2025, Kujur 2025, Nature 2025 research):
+  - Pattern 24: Repeated paragraph openings (>40% same opener)
+  - Pattern 25: Template sentence frames ("Another X is", "First,", etc.)
+  - Pattern 26: Hedging overuse (>15 per 1000 words)
+  - Pattern 27: Logical connective imbalance (therefore/thus vs but/though)
+- Added optional `--deep` flag for NLP analysis (requires spaCy)
+  - Syntactic tree depth variation
+  - POS tag diversity / noun-heavy style detection
+- Falls back gracefully to stdlib checks if spaCy not installed
+
 ## v5.0.0 (2026-04-11)
 
 - Full restructure following claude-skills authoring standard

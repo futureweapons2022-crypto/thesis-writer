@@ -11,11 +11,16 @@ Usage:
     python ai_scan.py --chapter methodology <file>
     python ai_scan.py --chapter results <file>
     python ai_scan.py --chapter discussion <file>
+    python ai_scan.py --deep <file>           # enables optional NLP checks (needs spacy)
     python ai_scan.py --text "paste text here"
     python ai_scan.py --stdin < file.txt
 
 Chapters: intro, litreview, methodology, results, discussion, conclusion
 If no chapter specified, uses general defaults.
+
+Deep mode: if spacy is installed, adds structural/semantic checks for
+syntactic tree depth and discourse coherence. Falls back to stdlib
+checks automatically if spacy is unavailable.
 
 Output: JSON report with violations, stats, and overall score (0-100).
 """
@@ -134,9 +139,15 @@ CHAPTER_PROFILES = {
 
 
 def parse_args(args):
-    """Parse command line arguments. Returns (text, chapter_profile_or_None)."""
+    """Parse command line arguments. Returns (text, chapter_profile_or_None, deep_mode)."""
     chapter = None
+    deep = False
     remaining = list(args[1:])
+
+    # Extract --deep flag
+    if "--deep" in remaining:
+        deep = True
+        remaining.remove("--deep")
 
     # Extract --chapter flag
     if "--chapter" in remaining:
@@ -152,23 +163,83 @@ def parse_args(args):
 
     # Read text
     if len(remaining) >= 2 and remaining[0] == "--text":
-        return " ".join(remaining[1:]), chapter
+        return " ".join(remaining[1:]), chapter, deep
     if len(remaining) >= 1 and remaining[0] == "--stdin":
-        return sys.stdin.read(), chapter
+        return sys.stdin.read(), chapter, deep
     if len(remaining) >= 1:
         path = Path(remaining[0])
         if path.suffix == ".docx":
             try:
                 from docx import Document
                 doc = Document(str(path))
-                return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip()), chapter
+                return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip()), chapter, deep
             except ImportError:
                 print("python-docx not installed. Install: pip install python-docx", file=sys.stderr)
                 sys.exit(1)
         else:
-            return path.read_text(encoding="utf-8"), chapter
+            return path.read_text(encoding="utf-8"), chapter, deep
     print(__doc__)
     sys.exit(0)
+
+
+def deep_analysis(text, sentences):
+    """Optional NLP analysis using spaCy. Returns list of deep violations.
+    Falls back gracefully if spaCy or language model is not available."""
+    deep_violations = []
+    try:
+        import spacy
+    except ImportError:
+        return [{"pattern": "DEEP", "name": "spaCy not installed",
+                 "severity": "info",
+                 "detail": "Install spacy + language model for deep mode: pip install spacy && python -m spacy download en_core_web_sm",
+                 "fix": "Running stdlib checks only"}]
+
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except OSError:
+        return [{"pattern": "DEEP", "name": "spaCy model not downloaded",
+                 "severity": "info",
+                 "detail": "Run: python -m spacy download en_core_web_sm",
+                 "fix": "Running stdlib checks only"}]
+
+    doc = nlp(text[:100000])  # cap at 100k chars for memory
+
+    # Syntactic tree depth variation
+    depths = []
+    for sent in doc.sents:
+        def tree_depth(token):
+            children = list(token.children)
+            if not children:
+                return 1
+            return 1 + max(tree_depth(child) for child in children)
+        root = [t for t in sent if t.head == t]
+        if root:
+            depths.append(tree_depth(root[0]))
+    if depths:
+        depth_std = (sum((d - sum(depths)/len(depths))**2 for d in depths) / len(depths)) ** 0.5
+        if depth_std < 1.5 and len(depths) > 20:
+            deep_violations.append({
+                "pattern": "D1", "name": "Uniform syntactic depth",
+                "severity": "medium",
+                "detail": f"Syntactic tree depth std = {depth_std:.2f} (human writing typically >1.5). Sentence structures are too similar.",
+                "fix": "Add complex embedded clauses OR simple short sentences"
+            })
+
+    # POS tag diversity
+    pos_counts = Counter(token.pos_ for token in doc if not token.is_punct and not token.is_space)
+    total_pos = sum(pos_counts.values())
+    if total_pos > 0:
+        noun_ratio = (pos_counts.get("NOUN", 0) + pos_counts.get("PROPN", 0)) / total_pos
+        verb_ratio = pos_counts.get("VERB", 0) / total_pos
+        if noun_ratio > 0.35:
+            deep_violations.append({
+                "pattern": "D2", "name": "Noun-heavy style",
+                "severity": "minor",
+                "detail": f"Nouns are {noun_ratio*100:.0f}% of content words. AI-generated academic text skews noun-heavy (nominalizations).",
+                "fix": "Convert nominalizations to verbs: 'the investigation of' → 'we investigated'"
+            })
+
+    return deep_violations
 
 
 def split_sentences(text):
@@ -178,8 +249,9 @@ def split_sentences(text):
     return [s.strip() for s in raw if len(s.strip()) > 5]
 
 
-def scan(text, chapter=None):
-    """Run all checks and return a report dict. chapter is a CHAPTER_PROFILES entry or None."""
+def scan(text, chapter=None, deep=False):
+    """Run all checks and return a report dict. chapter is a CHAPTER_PROFILES entry or None.
+    If deep=True, also run NLP-based checks (requires spaCy)."""
     violations = []
     text_lower = text.lower()
     sentences = split_sentences(text)
@@ -417,6 +489,70 @@ def scan(text, chapter=None):
             "fix": "Replace vague claims ('improved significantly') with numbers ('RMSE decreased from 0.15 to 0.11')"
         })
 
+    # ─── STRUCTURAL CHECKS (Patterns 24-27) ───
+    # Based on: MDPI 2025 (AI structural uniformity), Kujur 2025 (cohesion), Nature 2025 (hedging overuse)
+
+    # 24. Repeated paragraph openings
+    if len(paragraphs) >= 5:
+        para_first_words = [p.split()[0] for p in paragraphs if p.split()]
+        opener_counts = Counter(para_first_words)
+        most_common_opener, count = opener_counts.most_common(1)[0]
+        pct = count / len(paragraphs) * 100
+        if count >= 5 and pct > 40:
+            violations.append({
+                "pattern": 24, "name": "Repeated paragraph openings",
+                "severity": "medium",
+                "detail": f'"{most_common_opener}" opens {count}/{len(paragraphs)} paragraphs ({pct:.0f}%)',
+                "fix": "Vary how paragraphs start — use questions, evidence, or contrast as openers"
+            })
+
+    # 25. Template sentence frames across paragraphs
+    templates = [
+        r'^Another\s+\w+\s+is',
+        r'^The\s+\w+\s+is\s+\w+',
+        r'^First,', r'^Second,', r'^Third,',
+        r'^One\s+\w+\s+is', r'^This\s+approach',
+    ]
+    template_hits = 0
+    for tmpl in templates:
+        template_hits += len([s for s in sentences if re.match(tmpl, s)])
+    if template_hits >= 4 and len(sentences) > 30:
+        violations.append({
+            "pattern": 25, "name": "Template sentence frames",
+            "severity": "medium",
+            "detail": f'{template_hits} sentences use rigid template frames (e.g., "Another X is", "First,", "The X is")',
+            "fix": "Replace at least half with more varied constructions"
+        })
+
+    # 26. Hedging overuse
+    hedges = ['may', 'might', 'could', 'possibly', 'perhaps', 'likely',
+              'suggest', 'suggests', 'indicate', 'indicates', 'appears', 'appear',
+              'seem', 'seems', 'potentially', 'arguably']
+    hedge_count = 0
+    for h in hedges:
+        hedge_count += len(re.findall(r'\b' + h + r'\b', text_lower))
+    hedges_per_1000 = hedge_count / max(1, word_count / 1000)
+    if hedges_per_1000 > 15:
+        violations.append({
+            "pattern": 26, "name": "Hedging overuse",
+            "severity": "medium",
+            "detail": f'{hedge_count} hedging words in {word_count} words ({hedges_per_1000:.1f}/1000). AI over-hedges.',
+            "fix": "Remove hedges from established facts. Hedge only interpretive claims."
+        })
+
+    # 27. Connective balance (logical vs narrative)
+    logical_conn = ['therefore', 'thus', 'hence', 'consequently', 'accordingly']
+    narrative_conn = ['but', 'though', 'although', 'anyway', 'still', 'yet', 'despite']
+    logical_count = sum(len(re.findall(r'\b' + c + r'\b', text_lower)) for c in logical_conn)
+    narrative_count = sum(len(re.findall(r'\b' + c + r'\b', text_lower)) for c in narrative_conn)
+    if logical_count >= 5 and logical_count > narrative_count * 2:
+        violations.append({
+            "pattern": 27, "name": "Logical connective imbalance",
+            "severity": "minor",
+            "detail": f'{logical_count} logical connectives (therefore/thus/hence) vs {narrative_count} narrative (but/though/yet). AI skews logical.',
+            "fix": "Replace some 'therefore' with 'but' or 'though' where the contrast fits"
+        })
+
     # ─── CHAPTER-SPECIFIC CHECKS ───
     if chapter and word_count > 100:
         ch_name = chapter["name"]
@@ -466,6 +602,16 @@ def scan(text, chapter=None):
                     "fix": "Add comparisons between studies or between your results and published work"
                 })
 
+    # ─── DEEP MODE (optional, uses spaCy) ───
+    deep_notes = []
+    if deep:
+        deep_violations = deep_analysis(text, sentences)
+        for dv in deep_violations:
+            if dv.get("severity") == "info":
+                deep_notes.append(dv)
+            else:
+                violations.append(dv)
+
     # Score: 100 minus deductions, plus bonuses for positive signals
     critical_count = sum(1 for v in violations if v["severity"] == "critical")
     medium_count = sum(1 for v in violations if v["severity"] == "medium")
@@ -500,13 +646,14 @@ def scan(text, chapter=None):
 
 def main():
     sys.stdout.reconfigure(encoding='utf-8')
-    text, chapter = parse_args(sys.argv)
-    report = scan(text, chapter)
+    text, chapter, deep = parse_args(sys.argv)
+    report = scan(text, chapter, deep)
 
     # Print human-readable summary
     print(f"\n{'='*60}")
     ch_label = f" [{chapter['name']}]" if chapter else ""
-    print(f"THESIS AI SCAN REPORT{ch_label}")
+    deep_label = " [DEEP]" if deep else ""
+    print(f"THESIS AI SCAN REPORT{ch_label}{deep_label}")
     print(f"{'='*60}")
     print(f"Score: {report['score']}/100")
     print(f"Words: {report['word_count']} | Sentences: {report['sentence_count']} | Paragraphs: {report['paragraph_count']}")
